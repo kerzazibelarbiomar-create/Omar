@@ -2,59 +2,44 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
-import numpy as np
-
-from data_process.geometry import (
-    transform_points,
-    unproject_depth_to_points,
-    voxel_indices,
-)
+from data_process.geometry import transform_points, unproject_depth_to_points, voxel_indices
 
 
-def occupancy_from_frame(
-    depth: np.ndarray,
-    K: np.ndarray,
-    c2w: np.ndarray,
-    voxel_size: float,
-    valid_mask: Optional[np.ndarray] = None,
-    dynamic_mask: Optional[np.ndarray] = None,
-) -> set[tuple[int, int, int]]:
-    """从单帧深度图计算voxel occupancy集合"""
-    mask = depth > 0
+def occupancy_from_frame(depth, K, c2w, voxel_size: float, valid_mask=None, dynamic_mask=None):
+    if not isinstance(depth, (list, tuple)):
+        depth = [[depth]]
+    H = len(depth)
+    if H and not isinstance(depth[0], (list, tuple)):
+        depth = [[value] for value in depth]
+        W = 1
+    else:
+        W = len(depth[0]) if H else 0
+    mask = [[depth[h][w] > 0 for w in range(W)] for h in range(H)]
     if valid_mask is not None:
-        mask = mask & valid_mask
+        mask = [[mask[h][w] and bool(valid_mask[h][w]) for w in range(W)] for h in range(H)]
     if dynamic_mask is not None:
-        mask = mask & (~dynamic_mask)
+        mask = [[mask[h][w] and not bool(dynamic_mask[h][w]) for w in range(W)] for h in range(H)]
 
     points_cam = unproject_depth_to_points(depth, K, mask=mask)
-    if points_cam.size == 0:
+    if not points_cam:
         return set()
 
     points_world = transform_points(points_cam, c2w)
     vox = voxel_indices(points_world, voxel_size)
-    return set(map(tuple, vox.tolist()))
+    return set(map(tuple, vox))
 
 
 def iou_occupancy(a: set[tuple[int, int, int]], b: set[tuple[int, int, int]]) -> float:
-    """计算两个voxel集合的IOU (交集/并集)"""
     if not a and not b:
         return 0.0
-    inter = a.intersection(b)
-    union = a.union(b)
+    union = a | b
     if not union:
         return 0.0
-    return float(len(inter)) / float(len(union))
+    return len(a & b) / len(union)
 
 
 class RefSelectionResult:
-    """Result of reference frame selection with diagnostic info."""
-
-    def __init__(
-        self,
-        indices: list[int],
-        ious: list[float],
-        stats: dict,
-    ):
+    def __init__(self, indices: list[int], ious: list[float], stats: dict):
         self.indices = indices
         self.ious = ious
         self.stats = stats
@@ -64,51 +49,34 @@ class RefSelectionResult:
         return len(self.indices)
 
     def get_status_str(self) -> str:
-        """Get a human-readable status string for logging."""
         if self.count > 0:
             return f"ref={self.count}, best_iou={self.stats['best_iou']:.3f}"
-        else:
-            reason = self.stats.get("no_ref_reason", "unknown")
-            best = self.stats.get("best_iou", 0)
-            thresh = self.stats.get("threshold", 0)
-            if reason == "max_refs_zero":
-                return "ref=0 (max_refs=0)"
-            elif reason == "no_candidates":
-                return "ref=0 (no candidates)"
-            elif reason == "iou_below_threshold":
-                return f"ref=0 (best_iou={best:.3f}<{thresh:.3f})"
-            else:
-                return f"ref=0 ({reason})"
+        reason = self.stats.get("no_ref_reason", "unknown")
+        best = self.stats.get("best_iou", 0)
+        thresh = self.stats.get("threshold", 0)
+        if reason == "max_refs_zero":
+            return "ref=0 (max_refs=0)"
+        if reason == "no_candidates":
+            return "ref=0 (no candidates)"
+        if reason == "iou_below_threshold":
+            return f"ref=0 (best_iou={best:.3f}<{thresh:.3f})"
+        return f"ref=0 ({reason})"
 
 
 def select_reference_frames(
     candidate_indices: Iterable[int],
     target_indices: Iterable[int],
-    depths: np.ndarray,
-    intrinsics: np.ndarray,
-    poses_c2w: np.ndarray,
+    depths,
+    intrinsics,
+    poses_c2w,
     voxel_size: float,
     stride: int,
     iou_threshold: float,
     max_refs: int,
-    valid_masks: Optional[np.ndarray] = None,
-    dynamic_masks: Optional[np.ndarray] = None,
+    valid_masks=None,
+    dynamic_masks=None,
     return_result: bool = False,
 ):
-    """
-    Select reference frames based on spatial overlap with target frames.
-
-    For each target frame, find the candidate
-    with highest IOU. A candidate is selected as reference if its max IOU with any
-    target frame exceeds the threshold.
-
-    This is different from merging all target frames - we compute per-frame IOU
-    which gives much higher overlap scores.
-
-    Args:
-        return_result: If True, returns RefSelectionResult with diagnostic info.
-                      If False (default), returns (indices, ious) for backward compatibility.
-    """
     stats = {
         "threshold": iou_threshold,
         "max_refs": max_refs,
@@ -138,10 +106,8 @@ def select_reference_frames(
             return RefSelectionResult([], [], stats)
         return [], []
 
-    # Pre-compute occupancy for all target frames
-    target_occs = []
-    for idx in target_list:
-        occ = occupancy_from_frame(
+    target_occs = [
+        occupancy_from_frame(
             depth=depths[idx],
             K=intrinsics[idx],
             c2w=poses_c2w[idx],
@@ -149,12 +115,12 @@ def select_reference_frames(
             valid_mask=None if valid_masks is None else valid_masks[idx],
             dynamic_mask=None if dynamic_masks is None else dynamic_masks[idx],
         )
-        target_occs.append(occ)
+        for idx in target_list
+    ]
 
-    # Pre-compute occupancy for all candidate frames
     candidate_occs = {}
     for idx in candidates:
-        occ = occupancy_from_frame(
+        candidate_occs[idx] = occupancy_from_frame(
             depth=depths[idx],
             K=intrinsics[idx],
             c2w=poses_c2w[idx],
@@ -162,12 +128,9 @@ def select_reference_frames(
             valid_mask=None if valid_masks is None else valid_masks[idx],
             dynamic_mask=None if dynamic_masks is None else dynamic_masks[idx],
         )
-        candidate_occs[idx] = occ
 
-    # For each candidate, compute max IOU across all target frames
-    # Select the candidate with highest spatial overlap.
     scored = []
-    all_ious = []  # For debugging
+    all_ious = []
     for c_idx in candidates:
         c_occ = candidate_occs[c_idx]
         max_iou = 0.0
@@ -179,7 +142,6 @@ def select_reference_frames(
         if max_iou >= iou_threshold:
             scored.append((c_idx, max_iou))
 
-    # Compute statistics
     best_iou = max(x[1] for x in all_ious) if all_ious else 0.0
     avg_iou = sum(x[1] for x in all_ious) / len(all_ious) if all_ious else 0.0
     stats["best_iou"] = best_iou

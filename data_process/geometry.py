@@ -1,119 +1,117 @@
-"""
-几何变换基础函数
-
-提供深度图与3D点云之间的转换:
-- unproject: 深度图 -> 相机坐标系3D点
-- project: 相机坐标系3D点 -> 像素坐标
-- transform: 3D点坐标变换 (如 c2w, w2c)
-- voxel: 体素化相关操作
-"""
-
 from __future__ import annotations
 
 from typing import Optional
 
-import numpy as np
+
+def _shape(value):
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return (0,)
+        if isinstance(value[0], (list, tuple)):
+            return (len(value), len(value[0]))
+        return (len(value),)
+    return ()
 
 
-def unproject_depth_to_points(
-    depth: np.ndarray,
-    K: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-    return_pixels: bool = False,
-):
-    """
-    深度图反投影为相机坐标系3D点
+def _to_matrix(value):
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
 
-    使用相机内参K将2D像素+深度转换为3D点:
-    X = (u - cx) * Z / fx
-    Y = (v - cy) * Z / fy
-    Z = depth
-    """
-    if depth.ndim != 2:
+
+def unproject_depth_to_points(depth, K, mask=None, return_pixels=False):
+    if _shape(depth) != (len(depth), len(depth[0])):
         raise ValueError("depth must be HxW")
-    if K.shape != (3, 3):
+    if _shape(K) != (3, 3):
         raise ValueError("K must be 3x3")
 
-    H, W = depth.shape
+    H, W = len(depth), len(depth[0])
     if mask is None:
-        mask = depth > 0
+        mask = [[depth[h][w] > 0 for w in range(W)] for h in range(H)]
     else:
-        mask = mask & (depth > 0)
+        mask = [[bool(mask[h][w]) and depth[h][w] > 0 for w in range(W)] for h in range(H)]
 
-    ys, xs = np.nonzero(mask)
-    if ys.size == 0:
-        if return_pixels:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 2), dtype=np.int32)
-        return np.zeros((0, 3), dtype=np.float32)
-
-    z = depth[ys, xs].astype(np.float32)
-    fx = float(K[0, 0])
-    fy = float(K[1, 1])
-    cx = float(K[0, 2])
-    cy = float(K[1, 2])
-
-    x = (xs.astype(np.float32) - cx) * z / fx
-    y = (ys.astype(np.float32) - cy) * z / fy
-    points = np.stack([x, y, z], axis=1)
+    points = []
+    pixels = []
+    for h in range(H):
+        for w in range(W):
+            if not mask[h][w]:
+                continue
+            z = float(depth[h][w])
+            fx = float(K[0][0])
+            fy = float(K[1][1])
+            cx = float(K[0][2])
+            cy = float(K[1][2])
+            x = (w - cx) * z / fx
+            y = (h - cy) * z / fy
+            points.append([x, y, z])
+            pixels.append([w, h])
 
     if return_pixels:
-        pixels = np.stack([xs.astype(np.int32), ys.astype(np.int32)], axis=1)
         return points, pixels
     return points
 
 
-def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    """使用4x4变换矩阵变换3D点 (如c2w将相机坐标转为世界坐标)"""
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points must be Nx3")
-    if transform.shape != (4, 4):
+def transform_points(points, transform):
+    if not points:
+        return []
+    transform = _to_matrix(transform)
+    if _shape(transform) != (4, 4):
         raise ValueError("transform must be 4x4")
 
-    ones = np.ones((points.shape[0], 1), dtype=np.float32)
-    homo = np.concatenate([points.astype(np.float32), ones], axis=1)
-    transformed = (transform @ homo.T).T[:, :3]
-    return transformed.astype(np.float32)
+    result = []
+    for point in points:
+        x, y, z = point[:3]
+        px = transform[0][0] * x + transform[0][1] * y + transform[0][2] * z + transform[0][3]
+        py = transform[1][0] * x + transform[1][1] * y + transform[1][2] * z + transform[1][3]
+        pz = transform[2][0] * x + transform[2][1] * y + transform[2][2] * z + transform[2][3]
+        result.append([px, py, pz])
+    return result
 
 
-def project_points(points: np.ndarray, K: np.ndarray):
-    """将相机坐标系3D点投影到像素坐标，返回(uv坐标, z深度)"""
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points must be Nx3")
-    if K.shape != (3, 3):
+def project_points(points, K):
+    if not points:
+        return [], []
+    if _shape(K) != (3, 3):
         raise ValueError("K must be 3x3")
 
-    x = points[:, 0]
-    y = points[:, 1]
-    z = points[:, 2]
+    uv = []
+    z_values = []
+    for point in points:
+        x, y, z = point[:3]
+        fx = float(K[0][0])
+        fy = float(K[1][1])
+        cx = float(K[0][2])
+        cy = float(K[1][2])
+        if z > 0:
+            u = (x / z) * fx + cx
+            v = (y / z) * fy + cy
+        else:
+            u = float("nan")
+            v = float("nan")
+        uv.append([u, v])
+        z_values.append(z)
+    return uv, z_values
 
-    fx = float(K[0, 0])
-    fy = float(K[1, 1])
-    cx = float(K[0, 2])
-    cy = float(K[1, 2])
 
-    # Avoid divide by zero: use np.where to handle z <= 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        u = np.where(z > 0, (x / z) * fx + cx, np.nan)
-        v = np.where(z > 0, (y / z) * fy + cy, np.nan)
-    return np.stack([u, v], axis=1), z
-
-
-def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
-    """体素下采样: 每个voxel只保留一个点"""
+def voxel_downsample(points, voxel_size: float):
     if voxel_size <= 0:
-        return points.astype(np.float32)
-    if points.size == 0:
-        return points.astype(np.float32)
+        return points
+    if not points:
+        return []
 
-    vox = np.floor(points / voxel_size).astype(np.int32)
-    _, unique_idx = np.unique(vox, axis=0, return_index=True)
-    return points[unique_idx].astype(np.float32)
+    seen = {}
+    for point in points:
+        voxel = tuple(int(p // voxel_size) for p in point)
+        seen.setdefault(voxel, point)
+    return list(seen.values())
 
 
-def voxel_indices(points: np.ndarray, voxel_size: float) -> np.ndarray:
-    """计算每个点所属的voxel索引 (用于IOU计算)"""
-    if points.size == 0:
-        return np.zeros((0, 3), dtype=np.int32)
+def voxel_indices(points, voxel_size: float):
     if voxel_size <= 0:
         raise ValueError("voxel_size must be > 0")
-    return np.floor(points / voxel_size).astype(np.int32)
+    if not points:
+        return []
+    return [tuple(int(p // voxel_size) for p in point) for point in points]
